@@ -17,10 +17,10 @@ COPY src ./src
 COPY public ./public
 COPY static ./static
 
-# Baileys auth sessions live here - mount a volume over this path (see docker-compose.yml)
-# so linked WhatsApp numbers survive container restarts/upgrades.
-RUN mkdir -p /app/sessions
-VOLUME ["/app/sessions"]
+# Baileys auth sessions and downloaded WhatsApp media live here - mount volumes over these
+# paths (see docker-compose.yml) so linked numbers and media survive restarts/upgrades.
+RUN mkdir -p /app/sessions /app/media
+VOLUME ["/app/sessions", "/app/media"]
 
 ENV NODE_ENV=production
 EXPOSE 4000

@@ -23,7 +23,9 @@ services:
       - "4000:4000"
     volumes:
       - sessions-data:/app/sessions
+      - media-data:/app/media
 
 volumes:
   mongo-data:
   sessions-data:
+  media-data:
