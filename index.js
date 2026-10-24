@@ -16,6 +16,7 @@ import instanceRoutes from './src/routes/instanceRoutes.js';
 import subadminRoutes from './src/routes/subadminRoutes.js';
 import apiKeyRoutes from './src/routes/apiKeyRoutes.js';
 import publicRoutes from './src/routes/publicRoutes.js';
+import mediaRoutes from './src/routes/mediaRoutes.js';
 import { startAutoRefresh } from './src/services/proxyService.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +42,11 @@ const sessionMiddleware = session({
     secure: process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE === 'true',
   },
 });
+
+// --- Media files: public, protected by the signed ?token=... in each URL.
+// Mounted BEFORE the session middleware so file requests don't create session records. ---
+app.use('/media', mediaRoutes);
+
 app.use(sessionMiddleware);
 
 // --- API routes ---
