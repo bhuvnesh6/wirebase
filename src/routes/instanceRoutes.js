@@ -17,6 +17,9 @@ router.delete('/:id', ctrl.deleteInstance);
 router.patch('/:id/webhook', ctrl.updateWebhook);
 router.patch('/:id/proxy', ctrl.updateProxy);
 
+router.get('/:id/groups', ctrl.listGroups);
+router.patch('/:id/groups', ctrl.updateSelectedGroups);
+
 router.get('/:id/messages', ctrl.getMessages);
 router.post('/:id/send', ctrl.sendTestMessage);
 

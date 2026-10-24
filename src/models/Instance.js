@@ -19,7 +19,11 @@ const instanceSchema = new mongoose.Schema(
 
     webhookUrl: { type: String, default: null },
     webhookSecret: { type: String, default: null },
+
+    // Master switch for group recording. Only groups listed in selectedGroupIds are recorded.
     includeGroupMessages: { type: Boolean, default: false },
+    selectedGroupIds: { type: [String], default: [] },
+
     includeOwnMessages: { type: Boolean, default: true },
 
     useProxy: { type: Boolean, default: false },

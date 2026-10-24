@@ -67,7 +67,7 @@
           <div style="grid-column:span 2;display:flex;flex-direction:column;gap:24px;">
             <div class="card card-pad">
               <h3 style="font-size:16px;">Webhook</h3>
-              <p class="hint-text" style="margin-top:4px;">Every incoming message is POSTed here as JSON with the sender's number and message text.</p>
+              <p class="hint-text" style="margin-top:4px;">Every incoming message is POSTed here as JSON with the sender's number, message text, group details and media link (if any).</p>
               <form id="webhook-form" style="margin-top:16px;">
                 <div class="field">
                   <label class="label">Webhook URL</label>
@@ -75,7 +75,7 @@
                 </div>
                 <label class="checkbox-row" style="margin-bottom:16px;">
                   <input type="checkbox" id="include-groups" />
-                  <span style="font-size:14px;color:var(--ink-soft);">Also forward group messages</span>
+                  <span style="font-size:14px;color:var(--ink-soft);">Record &amp; forward group messages (only the groups selected below)</span>
                 </label>
                 <label class="checkbox-row" style="margin-bottom:16px;">
                   <input type="checkbox" id="include-own" />
@@ -95,6 +95,28 @@
                   <span class="hint-text" id="webhook-saved-msg" style="display:none;color:var(--signal-600);">Saved</span>
                 </div>
               </form>
+            </div>
+
+            <div class="card card-pad">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+                <div>
+                  <h3 style="font-size:16px;">Group recording</h3>
+                  <p class="hint-text" style="margin-top:4px;">Pick which groups this number should record. Works together with the "Record &amp; forward group messages" switch above — if no group is ticked, no group messages are recorded.</p>
+                </div>
+                <button type="button" class="btn btn-ghost btn-sm" id="refresh-groups-btn">Refresh groups</button>
+              </div>
+
+              <div class="field" style="margin-top:16px;margin-bottom:8px;">
+                <input class="input" id="group-search" placeholder="Search groups…" />
+              </div>
+              <p class="hint-text" id="groups-status" style="margin-bottom:8px;"></p>
+
+              <div id="group-list" style="display:flex;flex-direction:column;gap:8px;max-height:320px;overflow-y:auto;"></div>
+
+              <div style="display:flex;align-items:center;gap:12px;margin-top:16px;">
+                <button type="button" class="btn btn-primary" id="save-groups-btn">Save selected groups</button>
+                <span class="hint-text" id="groups-saved-msg" style="display:none;color:var(--signal-600);">Saved</span>
+              </div>
             </div>
 
             <div class="card card-pad">

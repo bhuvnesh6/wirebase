@@ -223,3 +223,24 @@ td { padding: 12px 16px; border-top: 1px solid var(--canvas-border); }
 .chip-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
 .chip-btn { border: 1px solid var(--canvas-border); border-radius: 8px; padding: 8px 10px; font-size: 12px; font-weight: 500; color: var(--ink-soft); background: #fff; cursor: pointer; text-align: center; }
 .chip-btn.active { border-color: var(--signal-400); background: var(--signal-50); color: var(--signal-600); }
+
+/* ---------- Toggle switch (NEW) ---------- */
+.switch-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  border: 1px solid var(--canvas-border); border-radius: 8px; padding: 10px 12px; cursor: pointer;
+}
+.switch-row:hover { background: var(--canvas-panel); }
+
+.switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; z-index: 1; }
+.switch-track {
+  position: absolute; inset: 0; border-radius: 999px; background: #d1d5db; transition: background .2s;
+}
+.switch-track::before {
+  content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(18,21,26,.3); transition: transform .2s;
+}
+.switch input:checked + .switch-track { background: var(--signal-500); }
+.switch input:checked + .switch-track::before { transform: translateX(18px); }
+.switch input:focus-visible + .switch-track { outline: 2px solid var(--signal-400); outline-offset: 2px; }
+.switch input:disabled + .switch-track { opacity: .5; }

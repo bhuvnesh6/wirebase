@@ -1,6 +1,12 @@
 import path from 'path';
 import fs from 'fs';
-import makeWASocket, { Browsers, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } from 'baileys';
+import makeWASocket, {
+  Browsers,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  downloadMediaMessage,
+} from 'baileys';
 import { Boom } from '@hapi/boom';
 import axios from 'axios';
 import QRCode from 'qrcode';
@@ -11,6 +17,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import Instance from '../models/Instance.js';
 import Message from '../models/Message.js';
 import { getRandomProxy } from './proxyService.js';
+import { saveMedia, MAX_MEDIA_BYTES } from './mediaService.js';
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -20,14 +27,37 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 const logger = P({ level: 'silent' });
 
 const KEEP_ALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const GROUP_NAME_TTL = 10 * 60 * 1000; // cache group names for 10 minutes
+const GROUP_LIST_TTL = 30 * 1000; // cache the full group list for 30 seconds (WhatsApp rate-limits this call)
 
-// live in-memory registry: instanceId -> { sock, io, keepAliveInterval }
+// live in-memory registry: instanceId -> { sock, io, keepAliveInterval, groupCache, groupListCache }
 const active = new Map();
 
 function room(instanceId) {
   return `instance:${instanceId}`;
 }
 
+// ---------------------------------------------------------------------------------------
+// Message parsing helpers
+// ---------------------------------------------------------------------------------------
+
+// Strips the common wrappers (disappearing messages, view-once, document-with-caption).
+function unwrapMessage(message) {
+  let current = message;
+
+  while (current) {
+    if (current.ephemeralMessage?.message) current = current.ephemeralMessage.message;
+    else if (current.viewOnceMessage?.message) current = current.viewOnceMessage.message;
+    else if (current.viewOnceMessageV2?.message) current = current.viewOnceMessageV2.message;
+    else if (current.viewOnceMessageV2Extension?.message) current = current.viewOnceMessageV2Extension.message;
+    else if (current.documentWithCaptionMessage?.message) current = current.documentWithCaptionMessage.message;
+    else break;
+  }
+
+  return current || {};
+}
+
+// expects an already-unwrapped message
 function extractMessageText(message) {
   if (!message) return null;
   if (message.conversation) return message.conversation;
@@ -41,6 +71,59 @@ function extractMessageText(message) {
   return null;
 }
 
+function toNumber(value) {
+  if (value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Metadata only - does NOT download the file.
+function getMediaInfo(content) {
+  if (!content) return null;
+
+  for (const key of ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage']) {
+    const item = content[key];
+    if (!item) continue;
+
+    return {
+      kind: key.replace('Message', ''),
+      mimeType: item.mimetype || null,
+      fileName: item.fileName || null,
+      caption: item.caption || null,
+      size: toNumber(item.fileLength),
+      sha256: item.fileSha256 ? Buffer.from(item.fileSha256).toString('base64') : null,
+    };
+  }
+
+  return null;
+}
+
+function getMessageType(content) {
+  const ignore = new Set(['messageContextInfo', 'senderKeyDistributionMessage']);
+  return Object.keys(content || {}).find((k) => !ignore.has(k)) || null;
+}
+
+// contextInfo (quoted message data) lives inside whichever message type was sent
+function getContextInfo(content) {
+  for (const value of Object.values(content || {})) {
+    if (value && typeof value === 'object' && value.contextInfo) return value.contextInfo;
+  }
+  return null;
+}
+
+function buildQuotedMessage(content) {
+  const ctx = getContextInfo(content);
+  if (!ctx?.stanzaId) return null;
+
+  const quoted = ctx.quotedMessage ? unwrapMessage(ctx.quotedMessage) : null;
+  return {
+    messageId: ctx.stanzaId,
+    participant: ctx.participant || null,
+    text: quoted ? extractMessageText(quoted) : null,
+    mediaType: quoted ? getMediaInfo(quoted)?.kind || null : null,
+  };
+}
+
 // WhatsApp increasingly sends messages with a "LID" (Linked ID) instead of the real phone
 // number, e.g. remoteJid "259910650560760@lid" instead of "919876543210@s.whatsapp.net" -
 // this is a privacy feature on WhatsApp's side, not a bug. Baileys exposes the real
@@ -50,7 +133,15 @@ function extractMessageText(message) {
 // e.g. via a business's { requestPhoneNumber: true } message) - in that case we return the LID
 // itself with isLid: true so callers/webhooks can tell the difference.
 async function resolveSender(msg, isGroup, sock) {
-  let jid = isGroup ? msg.key.participant || msg.key.remoteJid : msg.key.remoteJid;
+  let jid;
+
+  if (isGroup) {
+    // our own messages in a group carry no participant - the sender is us
+    jid = msg.key.participant || (msg.key.fromMe ? sock.user?.id : null) || msg.key.remoteJid;
+  } else {
+    jid = msg.key.remoteJid;
+  }
+
   const altJid = isGroup ? msg.key.participantAlt : msg.key.remoteJidAlt;
 
   if (jid?.endsWith('@lid') && altJid) {
@@ -67,8 +158,99 @@ async function resolveSender(msg, isGroup, sock) {
   }
 
   const isLid = !!jid?.endsWith('@lid');
-  return { number: (jid || '').split('@')[0], isLid };
+  // strip the ":device" suffix that our own JID can carry
+  const number = (jid || '').split('@')[0].split(':')[0];
+  return { number, isLid, jid: jid || null };
 }
+
+// ---------------------------------------------------------------------------------------
+// Group helpers
+// ---------------------------------------------------------------------------------------
+
+async function getGroupName(entry, groupJid) {
+  const cached = entry.groupCache.get(groupJid);
+  if (cached && Date.now() - cached.fetchedAt < GROUP_NAME_TTL) return cached.subject;
+
+  try {
+    const metadata = await entry.sock.groupMetadata(groupJid);
+    const subject = metadata.subject || null;
+    entry.groupCache.set(groupJid, { subject, fetchedAt: Date.now() });
+    return subject;
+  } catch (err) {
+    console.warn(chalk.yellow(`[baileysManager] could not resolve group name for ${groupJid}: ${err.message}`));
+    return cached?.subject ?? null;
+  }
+}
+
+// Lists every group the connected number participates in.
+export async function listGroups(instanceId, { force = false } = {}) {
+  const entry = active.get(instanceId);
+  if (!entry) throw new Error('Instance is not connected');
+
+  if (!force && entry.groupListCache && Date.now() - entry.groupListCache.fetchedAt < GROUP_LIST_TTL) {
+    return entry.groupListCache.groups;
+  }
+
+  const raw = await entry.sock.groupFetchAllParticipating();
+
+  const groups = Object.values(raw)
+    .map((g) => {
+      entry.groupCache.set(g.id, { subject: g.subject || null, fetchedAt: Date.now() });
+      return {
+        id: g.id,
+        name: g.subject || 'Unnamed group',
+        participantsCount: g.participants?.length ?? null,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  entry.groupListCache = { groups, fetchedAt: Date.now() };
+  return groups;
+}
+
+// ---------------------------------------------------------------------------------------
+// Media helper
+// ---------------------------------------------------------------------------------------
+
+// Downloads + stores the file. Never throws - a failure is recorded on the media object so
+// the message itself is still saved and delivered.
+async function processMedia(msg, sock, instanceId, info) {
+  const base = { ...info, url: null, storedName: null, status: 'failed', error: null };
+
+  if (info.size && info.size > MAX_MEDIA_BYTES) {
+    return { ...base, status: 'skipped', error: `File is larger than the ${MAX_MEDIA_BYTES / 1024 / 1024} MB limit` };
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      { logger, reuploadRequest: sock.updateMediaMessage }
+    );
+
+    if (buffer.length > MAX_MEDIA_BYTES) {
+      return { ...base, status: 'skipped', error: `File is larger than the ${MAX_MEDIA_BYTES / 1024 / 1024} MB limit` };
+    }
+
+    const saved = await saveMedia(instanceId, buffer, { mimeType: info.mimeType, fileName: info.fileName });
+    return { ...info, size: buffer.length, url: saved.url, storedName: saved.storedName, status: 'stored', error: null };
+  } catch (err) {
+    console.error(chalk.red(`[baileysManager] media download failed for instance ${instanceId}:`), err.message);
+    return { ...base, error: err.message };
+  }
+}
+
+// The DB uses `kind`; the webhook exposes it as `type`.
+function mediaForWebhook(media) {
+  if (!media) return null;
+  const { kind, ...rest } = media;
+  return { type: kind, ...rest };
+}
+
+// ---------------------------------------------------------------------------------------
+// Webhook / status
+// ---------------------------------------------------------------------------------------
 
 async function postToWebhook(instanceDoc, payload) {
   if (!instanceDoc.webhookUrl) return false;
@@ -112,6 +294,10 @@ function startKeepAlive(instanceId, sock) {
   return keepAliveInterval;
 }
 
+// ---------------------------------------------------------------------------------------
+// Instance lifecycle
+// ---------------------------------------------------------------------------------------
+
 export async function startInstance(instanceId, io) {
   if (active.has(instanceId)) return active.get(instanceId).sock;
 
@@ -144,7 +330,8 @@ export async function startInstance(instanceId, io) {
 
   const sock = makeWASocket(socketOptions);
   const keepAliveInterval = startKeepAlive(instanceId, sock);
-  active.set(instanceId, { sock, io, keepAliveInterval });
+  const entry = { sock, io, keepAliveInterval, groupCache: new Map(), groupListCache: null };
+  active.set(instanceId, entry);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -178,8 +365,8 @@ export async function startInstance(instanceId, io) {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       const reason = lastDisconnect?.error?.message || 'unknown';
 
-      const entry = active.get(instanceId);
-      if (entry?.keepAliveInterval) clearInterval(entry.keepAliveInterval);
+      const current = active.get(instanceId);
+      if (current?.keepAliveInterval) clearInterval(current.keepAliveInterval);
       active.delete(instanceId);
 
       if (loggedOut) {
@@ -201,48 +388,81 @@ export async function startInstance(instanceId, io) {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // keep the cached group names fresh when someone renames a group
+  sock.ev.on('groups.update', (updates) => {
+    for (const u of updates) {
+      if (u.id && u.subject) {
+        entry.groupCache.set(u.id, { subject: u.subject, fetchedAt: Date.now() });
+        entry.groupListCache = null;
+      }
+    }
+  });
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     const instanceNow = await Instance.findById(instanceId);
     if (!instanceNow) return;
 
+    const selectedGroups = new Set(instanceNow.selectedGroupIds || []);
+
     for (const msg of messages) {
       try {
         if (!msg.message) continue;
 
         const remoteJid = msg.key.remoteJid || '';
+        if (!remoteJid || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) continue;
+
         const isGroup = remoteJid.endsWith('@g.us');
         const fromMe = !!msg.key.fromMe;
+        const direction = fromMe ? 'out' : 'in';
 
-        // Skip group messages unless this instance has opted in
-        if (isGroup && !instanceNow.includeGroupMessages) continue;
+        // Groups: master toggle must be on AND this specific group must be selected
+        if (isGroup) {
+          if (!instanceNow.includeGroupMessages) continue;
+          if (!selectedGroups.has(remoteJid)) continue;
+        }
 
         // Skip our own outgoing messages unless this instance has opted in
         if (fromMe && !instanceNow.includeOwnMessages) continue;
 
-        const senderJid = isGroup ? msg.key.participant || remoteJid : remoteJid;
-        const { number, isLid } = await resolveSender(msg, isGroup, sock);
+        const content = unwrapMessage(msg.message);
+        const text = extractMessageText(content);
+        const mediaInfo = getMediaInfo(content);
+
+        // Keep media-only messages; skip protocol/system messages that have neither text nor media
+        if (text === null && !mediaInfo) continue;
+
+        // WhatsApp can re-deliver messages after a reconnect - don't record/forward them twice
+        if (msg.key.id && (await Message.exists({ instance: instanceId, messageId: msg.key.id, direction }))) continue;
+
+        const { number, isLid, jid: senderJid } = await resolveSender(msg, isGroup, sock);
         if (isLid) {
           console.warn(
             chalk.yellow(`[baileysManager] instance ${instanceId}: no phone number mapping for LID ${senderJid} yet - using LID as-is`)
           );
         }
-        const text = extractMessageText(msg.message);
-        if (text === null) continue;
 
-        const direction = fromMe ? 'out' : 'in';
+        const groupName = isGroup ? await getGroupName(entry, remoteJid) : null;
+        const quotedMessage = buildQuotedMessage(content);
+        const media = mediaInfo ? await processMedia(msg, sock, instanceId, mediaInfo) : null;
+        const rawMessageType = getMessageType(content);
 
         const doc = await Message.create({
           instance: instanceId,
           direction,
           number,
           isLid,
-          message: text,
+          senderJid,
+          message: text || '',
           isGroup,
-          groupId: isGroup ? remoteJid.split('@')[0] : null,
+          groupId: isGroup ? remoteJid : null,
+          groupName,
           pushName: msg.pushName || null,
           messageId: msg.key.id,
+          rawMessageType,
+          media,
+          quotedMessage,
           waTimestamp: new Date((Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000),
         });
 
@@ -251,24 +471,44 @@ export async function startInstance(instanceId, io) {
           direction,
           number,
           isLid,
-          message: text,
+          message: text || '',
           isGroup,
+          groupId: isGroup ? remoteJid : null,
+          groupName,
           pushName: msg.pushName || null,
+          media,
+          quotedMessage,
           timestamp: doc.waTimestamp,
         });
 
         const delivered = await postToWebhook(instanceNow, {
+          event: 'whatsapp.message.received',
           instanceId,
           instanceName: instanceNow.name,
+          messageId: msg.key.id,
           direction,
+          timestamp: doc.waTimestamp,
+
+          message: text || '',
+          messageType: rawMessageType,
+
+          // flat fields kept so existing webhook consumers keep working
           number,
           isLid,
-          message: text,
           isGroup,
           groupId: isGroup ? remoteJid.split('@')[0] : null,
           pushName: msg.pushName || null,
-          timestamp: doc.waTimestamp,
-          messageId: msg.key.id,
+
+          // richer structured fields
+          sender: {
+            name: msg.pushName || null,
+            number,
+            jid: senderJid,
+            isLid,
+          },
+          group: isGroup ? { id: remoteJid, name: groupName } : null,
+          media: mediaForWebhook(media),
+          quotedMessage,
         });
 
         await Message.findByIdAndUpdate(doc._id, { webhookDelivered: delivered, $inc: { webhookAttempts: 1 } });
